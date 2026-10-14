@@ -343,6 +343,11 @@ pub struct MediaPipeline {
     rtp: RtpStream,
     send_roc: RocTracker,
     recv_streams: SrtpRecvStreams,
+    /// Rollover and replay state for the peer's other streams under the same keys: its video FEC,
+    /// retransmission and app-data packets, which the audio profile does not decode but which can
+    /// carry its audio piggybacked. Kept apart from `recv_streams` so they cannot take a slot an
+    /// audio stream needs.
+    aux_recv_streams: SrtpRecvStreams,
     srtcp: SrtcpSender,
     recv_srtcp_keys: E2eSrtpKeys,
     recv_srtcp_replay: SrtcpReplayState,
@@ -397,6 +402,7 @@ impl MediaPipeline {
             rtp: RtpStream::new(p.ssrc, p.samples_per_packet, false),
             send_roc: RocTracker::default(),
             recv_streams: SrtpRecvStreams::default(),
+            aux_recv_streams: SrtpRecvStreams::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, false)?,
             recv_srtcp_keys: derive_srtcp_keys(
                 p.call_key,
@@ -457,6 +463,7 @@ impl MediaPipeline {
         self.recv_keys = keys;
         self.recv_srtcp_keys = srtcp_keys;
         self.recv_streams = SrtpRecvStreams::default();
+        self.aux_recv_streams = SrtpRecvStreams::default();
         self.recv_srtcp_replay = SrtcpReplayState::default();
         true
     }
@@ -526,6 +533,21 @@ impl MediaPipeline {
         unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_streams,
+            self.warp_mi_tag_len,
+            packet,
+        )
+    }
+
+    /// Authenticate and decrypt one of the peer's packets that is not audio for this pipeline: a
+    /// video packet with no video plane to take it, or a packet on its FEC, retransmission or
+    /// app-data streams. Same keys and tag as the audio, which is what the peer protects all of its
+    /// streams with, but its own per-SSRC replay state.
+    ///
+    /// The point is the audio such a packet can carry piggybacked; the caller splits it off.
+    pub(crate) fn unprotect_auxiliary(&mut self, packet: &[u8]) -> Option<(RtpHeader, Vec<u8>)> {
+        unprotect_srtp_packet(
+            &self.recv_keys,
+            &mut self.aux_recv_streams,
             self.warp_mi_tag_len,
             packet,
         )
@@ -621,6 +643,8 @@ fn unprotect_srtp_packet(
 /// reassembled from them on receive.
 type TimestampedAccessUnit = (u32, Vec<u8>, Option<u8>);
 type VideoPacketResult = (RtpHeader, Vec<TimestampedAccessUnit>);
+/// [`VideoPacketResult`] plus the audio packet the video packet carried piggybacked, if any.
+type VideoPacketSplit = (RtpHeader, Vec<TimestampedAccessUnit>, Option<Vec<u8>>);
 
 pub struct VideoPipeline {
     send_keys: E2eSrtpKeys,
@@ -898,12 +922,31 @@ impl VideoPipeline {
     }
 
     pub(crate) fn unprotect_video_packet(&mut self, packet: &[u8]) -> Option<VideoPacketResult> {
-        let (header, payload) = unprotect_srtp_packet(
+        self.unprotect_video_packet_split(packet)
+            .map(|(header, completed, _)| (header, completed))
+    }
+
+    /// [`Self::unprotect_video_packet`], also handing back the audio packet the video packet
+    /// carried piggybacked (see [`WHATSAPP_RTP_EXTENSION_AUDIO_PIGGYBACK_ID`]).
+    ///
+    /// Only the video part reaches the depacketizer. Fed the whole payload, the audio would be read
+    /// as the tail of an H.264 unit, which corrupts the slice it lands on, and the audio itself is
+    /// lost: a WhatsApp client in a video call sends its speech this way whenever a video packet
+    /// is going out.
+    ///
+    /// [`WHATSAPP_RTP_EXTENSION_AUDIO_PIGGYBACK_ID`]:
+    ///     super::rtp::WHATSAPP_RTP_EXTENSION_AUDIO_PIGGYBACK_ID
+    pub(crate) fn unprotect_video_packet_split(
+        &mut self,
+        packet: &[u8],
+    ) -> Option<VideoPacketSplit> {
+        let (header, mut payload) = unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.recv_streams,
             self.warp_mi_tag_len,
             packet,
         )?;
+        let piggybacked_audio = super::rtp::split_whatsapp_audio_piggyback(packet, &mut payload);
         // Counted BEFORE the grace check, and for every authenticated packet including the ones that
         // check ignores. Counting only the stream that replaced the retired one would never expire
         // the grace in the case that matters: a peer that sends one packet on a new SSRC and then
@@ -942,7 +985,9 @@ impl VideoPipeline {
                 if self.packets_since_stream_change <= RETIRED_SSRC_GRACE_PACKETS
                     || self.retired_ssrc_run < RETIRED_SSRC_RESUME_PACKETS
                 {
-                    return Some((header, Vec::new()));
+                    // Its picture is ignored, but the audio it carries is the peer's current
+                    // audio: the audio stream does not change with the video SSRC.
+                    return Some((header, Vec::new(), piggybacked_audio));
                 }
             }
             if self.depacketizer_ssrc.is_some() {
@@ -993,7 +1038,7 @@ impl VideoPipeline {
             completed.push((timestamp, au, orientation));
             next = self.depacketizer.pop_ready();
         }
-        Some((header, completed))
+        Some((header, completed, piggybacked_audio))
     }
 }
 
