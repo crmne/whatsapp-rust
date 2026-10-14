@@ -535,14 +535,15 @@ pub struct MediaStats {
     pub forwarding_envelope_rejected: u32,
     #[builder(default)]
     pub codec_switches: u16,
-    /// Video RTP packets on the direct path whose tag authenticated.
+    /// Video RTP packets on the direct path whose tag authenticated, whether or not a video plane
+    /// was active to show them.
     ///
     /// The video half of `rtp_received`. Without it a call showing no picture cannot say whether
     /// the peer's video never arrived or arrived and was not usable.
     #[builder(default)]
     pub video_rtp_received: u32,
-    /// Video RTP packets on the direct path whose tag did not authenticate: wrong recv keys, or
-    /// keys for a device other than the one sending.
+    /// Video RTP packets on the direct path whose tag did not authenticate, with or without an
+    /// active video plane: wrong recv keys, or keys for a device other than the one sending.
     #[builder(default)]
     pub video_srtp_unprotect_failed: u32,
     /// Audio RTP packets recovered from inside another packet the peer sent: its video and video
