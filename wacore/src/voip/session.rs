@@ -198,6 +198,20 @@ impl SrtpRecvStreams {
         let (_, roc, replay) = self.overflow.last_mut().expect("just pushed");
         Some((roc, replay))
     }
+
+    /// Accept an AUTHENTICATED packet's `(ssrc, seq)` at the rollover counter `roc` estimated for
+    /// it: `false` for a replay, or once the stream cap is reached. On acceptance the counter
+    /// advances, so the next packet of the stream is estimated from this one.
+    fn accept(&mut self, ssrc: u32, seq: u16, roc: u32) -> bool {
+        let Some((recv_roc, recv_replay)) = self.commit_mut(ssrc) else {
+            return false;
+        };
+        if !recv_replay.accept((u64::from(roc) << 16) | u64::from(seq)) {
+            return false;
+        }
+        recv_roc.commit_roc(roc, seq);
+        true
+    }
 }
 
 #[derive(Default)]
@@ -348,6 +362,11 @@ pub struct MediaPipeline {
     /// carry its audio piggybacked. Kept apart from `recv_streams` so they cannot take a slot an
     /// audio stream needs.
     aux_recv_streams: SrtpRecvStreams,
+    /// Rollover and replay state for the peer's video while the call has no video plane yet: a peer
+    /// upgrading to video sends before this side takes the upgrade up, with its audio inside. The
+    /// plane built later takes this over ([`VideoPipeline::adopt_recv_state`]) rather than starting
+    /// the stream afresh, which would lose its rollover counter and accept its packets again.
+    video_recv_streams: SrtpRecvStreams,
     srtcp: SrtcpSender,
     recv_srtcp_keys: E2eSrtpKeys,
     recv_srtcp_replay: SrtcpReplayState,
@@ -403,6 +422,7 @@ impl MediaPipeline {
             send_roc: RocTracker::default(),
             recv_streams: SrtpRecvStreams::default(),
             aux_recv_streams: SrtpRecvStreams::default(),
+            video_recv_streams: SrtpRecvStreams::default(),
             srtcp: SrtcpSender::new(p.call_key, p.self_lid, rtcp_cname, false)?,
             recv_srtcp_keys: derive_srtcp_keys(
                 p.call_key,
@@ -464,6 +484,7 @@ impl MediaPipeline {
         self.recv_srtcp_keys = srtcp_keys;
         self.recv_streams = SrtpRecvStreams::default();
         self.aux_recv_streams = SrtpRecvStreams::default();
+        self.video_recv_streams = SrtpRecvStreams::default();
         self.recv_srtcp_replay = SrtcpReplayState::default();
         true
     }
@@ -538,16 +559,45 @@ impl MediaPipeline {
         )
     }
 
+    /// Accept an audio packet the peer carried inside another of its packets, which authenticated
+    /// as a whole: the same replay and rollover state as [`Self::unprotect_audio`], keyed by the
+    /// carried packet's own SSRC and sequence number.
+    ///
+    /// `false` for audio already accepted, standalone or carried. A peer can send the same audio
+    /// packet in more than one carrier, and every copy past the first would be decoded again. And
+    /// the rollover counter follows the carried audio, so standalone audio after a wrap that only
+    /// carried packets saw is still read at the counter it was protected with.
+    pub(crate) fn accept_carried_audio(&mut self, header: &RtpHeader) -> bool {
+        let roc = self
+            .recv_streams
+            .estimate_roc(header.ssrc, header.sequence_number);
+        self.recv_streams
+            .accept(header.ssrc, header.sequence_number, roc)
+    }
+
     /// Authenticate and decrypt one of the peer's packets that is not audio for this pipeline: a
-    /// video packet with no video plane to take it, or a packet on its FEC, retransmission or
-    /// app-data streams. Same keys and tag as the audio, which is what the peer protects all of its
-    /// streams with, but its own per-SSRC replay state.
+    /// packet on its FEC, retransmission or app-data streams. Same keys and tag as the audio, which
+    /// is what the peer protects all of its streams with, but its own per-SSRC replay state.
     ///
     /// The point is the audio such a packet can carry piggybacked; the caller splits it off.
     pub(crate) fn unprotect_auxiliary(&mut self, packet: &[u8]) -> Option<(RtpHeader, Vec<u8>)> {
         unprotect_srtp_packet(
             &self.recv_keys,
             &mut self.aux_recv_streams,
+            self.warp_mi_tag_len,
+            packet,
+        )
+    }
+
+    /// Authenticate and decrypt one of the peer's video packets while the call has no video plane,
+    /// for the audio it carries. Its receive state is the one the plane adopts once it is built.
+    pub(crate) fn unprotect_video_without_plane(
+        &mut self,
+        packet: &[u8],
+    ) -> Option<(RtpHeader, Vec<u8>)> {
+        unprotect_srtp_packet(
+            &self.recv_keys,
+            &mut self.video_recv_streams,
             self.warp_mi_tag_len,
             packet,
         )
@@ -626,12 +676,9 @@ fn unprotect_srtp_packet(
         return None;
     }
     // Authenticated: only now is it safe to allocate state for this SSRC and advance its counter.
-    let (recv_roc, recv_replay) = recv_streams.commit_mut(header.ssrc)?;
-    let index = (u64::from(roc) << 16) | u64::from(header.sequence_number);
-    if !recv_replay.accept(index) {
+    if !recv_streams.accept(header.ssrc, header.sequence_number, roc) {
         return None;
     }
-    recv_roc.commit_roc(roc, header.sequence_number);
     let cipher = &without_tag[header_len..];
     let plain = crypt_payload(recv_keys, header.ssrc, header.sequence_number, roc, cipher);
     Some((header, plain))
@@ -918,6 +965,28 @@ impl VideoPipeline {
                 .into_iter()
                 .map(|(_, access_unit, _)| access_unit)
                 .collect(),
+        )
+    }
+
+    /// Take over the receive state `media` kept for the peer's video before this plane existed, so
+    /// the stream continues at its rollover counter and replay window instead of starting afresh.
+    /// Both derive their recv keys from the same participant id.
+    pub(crate) fn adopt_recv_state(&mut self, media: &mut MediaPipeline) {
+        self.recv_streams = std::mem::take(&mut media.video_recv_streams);
+    }
+
+    /// Authenticate and decrypt a video packet while the plane is inactive, for the audio it
+    /// carries: the picture is not reassembled, but the stream's rollover counter and replay window
+    /// advance exactly as they would with the plane active, so a later re-upgrade continues them.
+    pub(crate) fn unprotect_without_picture(
+        &mut self,
+        packet: &[u8],
+    ) -> Option<(RtpHeader, Vec<u8>)> {
+        unprotect_srtp_packet(
+            &self.recv_keys,
+            &mut self.recv_streams,
+            self.warp_mi_tag_len,
+            packet,
         )
     }
 
