@@ -44,10 +44,12 @@ use super::rtcp::{
 use super::rtp::RTP_PAYLOAD_TYPE_MLOW_RED;
 use super::rtp::{
     RTP_PAYLOAD_TYPE_APP_DATA, RTP_PAYLOAD_TYPE_H264, VIDEO_CLOCK_RATE, VIDEO_TS_STRIDE_15FPS,
-    parse_rtp_header, plain_rtp_payload, split_whatsapp_audio_piggyback,
+    parse_rtp_header, parse_whatsapp_audio_piggyback_offset, plain_rtp_payload,
+    split_whatsapp_audio_piggyback,
 };
 use super::session::{
-    CallDirection, MediaPipeline, MediaPipelineParams, VideoPipeline, VideoPipelineParams,
+    CallDirection, MediaPipeline, MediaPipelineParams, SrtpReceiveError, VideoPipeline,
+    VideoPipelineParams,
 };
 use super::sframe::{SframeIn, SframeSession};
 use super::{ssrc, stun};
@@ -2787,9 +2789,16 @@ impl CallEngine {
             // The audio a WhatsApp client carries inside its video in a video call. Taken out here
             // and played once the media borrow has ended.
             let mut piggybacked = None;
-            let authenticated = match m.video.as_mut() {
+            // The clear extension identifies an audio arrival even when its tag fails.
+            // Pure video must not keep the audio watchdog alive.
+            let audio_carrier = parse_whatsapp_audio_piggyback_offset(pkt).is_some();
+            if audio_carrier {
+                self.health.media_started(now);
+                self.health.on_rtp(now);
+            }
+            let received = match m.video.as_mut() {
                 Some(v) if v.active => match v.pipe.unprotect_video_packet_split(pkt) {
-                    Some((header, completed, audio)) => {
+                    Ok((header, completed, audio)) => {
                         v.reception.observe(
                             header.ssrc,
                             header.sequence_number,
@@ -2811,9 +2820,9 @@ impl CallEngine {
                             }));
                         }
                         piggybacked = audio;
-                        Some(())
+                        Ok(())
                     }
-                    None => None,
+                    Err(error) => Err(error),
                 },
                 // No ACTIVE plane (not negotiated, or after a downgrade): the picture is dropped.
                 // Its audio is not. Whatever video the peer still sends, during an upgrade this
@@ -2834,22 +2843,22 @@ impl CallEngine {
                     .map(|(_, mut payload)| {
                         piggybacked = split_whatsapp_audio_piggyback(pkt, &mut payload);
                     }),
-            }
-            .is_some();
-            if authenticated {
+            };
+            if received.is_ok() {
                 self.media_stats.video_rtp_received =
                     self.media_stats.video_rtp_received.saturating_add(1);
-            } else {
-                // Counted, unlike before, and whether or not a plane is active: a peer whose video
-                // fails its tag otherwise looks exactly like a peer that sends no video, and with
-                // its audio riding inside the video, like a peer that sends nothing at all.
+            } else if received == Err(SrtpReceiveError::AuthenticationFailed) {
                 self.media_stats.video_srtp_unprotect_failed = self
                     .media_stats
                     .video_srtp_unprotect_failed
                     .saturating_add(1);
+                if audio_carrier {
+                    self.media_stats.srtp_unprotect_failed =
+                        self.media_stats.srtp_unprotect_failed.saturating_add(1);
+                }
             }
             if let Some(audio) = piggybacked {
-                self.on_piggybacked_audio(now, &audio, true);
+                self.on_piggybacked_audio(now, &audio);
             }
             return;
         }
@@ -2895,7 +2904,7 @@ impl CallEngine {
             }
             if let Some(audio) = piggybacked {
                 // This packet was already counted as an arrival above.
-                self.on_piggybacked_audio(now, &audio, false);
+                self.on_piggybacked_audio(now, &audio);
             }
             return;
         }
@@ -2913,10 +2922,9 @@ impl CallEngine {
     ///
     /// The outer packet authenticated and was decrypted as a whole, which is what protects this
     /// one: it is plain RTP, header and payload, with no tag of its own. From here it is audio like
-    /// any other and takes the same gate and the same decode. `arrival` says whether the watchdog
-    /// still has to hear of it: a video packet is not an audio arrival, but a FEC packet on an
-    /// unexpected type was already counted as one.
-    fn on_piggybacked_audio(&mut self, now: Millis, packet: &[u8], arrival: bool) {
+    /// any other and takes the same gate and the same decode. The caller has already counted
+    /// the carrier as an audio arrival, before authentication.
+    fn on_piggybacked_audio(&mut self, now: Millis, packet: &[u8]) {
         let Some(header) = parse_rtp_header(packet) else {
             // What it was carried by authenticated, so this is a sender writing a piggyback this
             // side cannot read, not noise. Counted where every unreadable packet is.
@@ -2924,10 +2932,6 @@ impl CallEngine {
                 self.media_stats.relay_packet_unclassified.saturating_add(1);
             return;
         };
-        if arrival {
-            self.health.media_started(now);
-            self.health.on_rtp(now);
-        }
         let Some(m) = self.media.as_mut() else {
             return;
         };
@@ -12033,5 +12037,122 @@ mod tests {
         let stats = eng.media_stats();
         assert_eq!(stats.srtp_unprotect_failed, 0);
         assert_eq!(stats.rtp_received, 5);
+    }
+
+    #[test]
+    fn carried_audio_before_the_local_origin_does_not_poison_replay() {
+        let mut eng = allocated_video_engine(CallDirection::Incoming);
+        let tone = mlow_tone_frames(1).pop().unwrap();
+        for (n, inner) in [0u16, 65535, 1, 2].into_iter().enumerate() {
+            let audio = plain_peer_audio(
+                crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE,
+                inner,
+                &tone,
+            );
+            let packet = peer_packet_carrying_audio(
+                RTP_PAYLOAD_TYPE_H264,
+                peer_video_ssrc(),
+                n as u16 + 1,
+                &[0x65, 1, 2, 3],
+                &audio,
+            );
+            eng.handle_input(n as u64 + 2, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+        assert_eq!(eng.media_stats().piggybacked_audio_received, 3);
+        eng.handle_input(10, Input::RelayPacket(&peer_audio_at_roc(3, 0, &tone)));
+        let _ = drain(&mut eng);
+        assert_eq!(eng.media_stats().rtp_received, 4);
+        assert_eq!(eng.media_stats().srtp_unprotect_failed, 0);
+    }
+
+    #[test]
+    fn replayed_video_is_not_an_authentication_failure() {
+        for state in 0..3 {
+            let mut eng = allocated_video_engine(CallDirection::Incoming);
+            if state == 1 {
+                eng.disable_video();
+            }
+            if state == 2 {
+                eng = allocated_engine();
+            }
+            let mut peer = peer_video_pipe();
+            let packet = peer.protect_video(&video_au(100)).pop().unwrap();
+            for now in [2, 3] {
+                eng.handle_input(now, Input::RelayPacket(&packet));
+                let _ = drain(&mut eng);
+            }
+            assert_eq!(eng.media_stats().video_rtp_received, 1);
+            assert_eq!(eng.media_stats().video_srtp_unprotect_failed, 0);
+        }
+    }
+
+    #[test]
+    fn failed_audio_carriers_report_authentication_failure() {
+        for state in 0..3 {
+            let mut eng = allocated_video_engine(CallDirection::Incoming);
+            if state == 1 {
+                eng.disable_video();
+            }
+            if state == 2 {
+                eng = allocated_engine();
+            }
+            let mut events = Vec::new();
+            for n in 0..80u16 {
+                let audio = plain_peer_audio(
+                    crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE,
+                    n,
+                    &[0x50, 1, 2],
+                );
+                let mut packet = peer_packet_carrying_audio(
+                    RTP_PAYLOAD_TYPE_H264,
+                    peer_video_ssrc(),
+                    n,
+                    &[0x65, 1, 2, 3],
+                    &audio,
+                );
+                *packet.last_mut().unwrap() ^= 1;
+                let now = u64::from(n) * 60 + 1;
+                eng.handle_input(now, Input::RelayPacket(&packet));
+                events.extend(drain(&mut eng).0);
+                eng.handle_input(now + 60, Input::Timeout);
+                events.extend(drain(&mut eng).0);
+            }
+            assert!(
+                !events
+                    .iter()
+                    .any(|o| matches!(o, Output::Event(CallEvent::AudioReceptionStalled { .. })))
+            );
+            assert!(events.iter().any(|o| matches!(
+                o,
+                Output::Event(CallEvent::AudioSilent {
+                    dominant_reason: AudioSilenceReason::AuthenticationFailing,
+                    ..
+                })
+            )));
+        }
+    }
+
+    #[test]
+    fn pure_video_does_not_hide_an_audio_stall() {
+        let mut eng = allocated_video_engine(CallDirection::Incoming);
+        let mut peer = peer_video_pipe();
+        let mut events = Vec::new();
+        for n in 0..80u64 {
+            let mut packet = peer.protect_video(&video_au(100)).pop().unwrap();
+            *packet.last_mut().unwrap() ^= 1;
+            let now = n * 60 + 1;
+            eng.handle_input(now, Input::RelayPacket(&packet));
+            events.extend(drain(&mut eng).0);
+            eng.handle_input(now + 60, Input::Timeout);
+            events.extend(drain(&mut eng).0);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|o| matches!(o, Output::Event(CallEvent::AudioReceptionStalled { .. })))
+        );
+        assert_eq!(eng.media_stats().srtp_unprotect_failed, 0);
+        assert_eq!(eng.media_stats().video_srtp_unprotect_failed, 80);
     }
 }
