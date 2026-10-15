@@ -2012,8 +2012,6 @@ impl CallEngine {
         ) {
             Some(mut v) => {
                 v.send_gated = send_gated;
-                // The peer's video may have arrived before this plane, for the audio it carries;
-                // the plane continues that stream rather than starting it afresh.
                 v.pipe.adopt_recv_state(&mut m.pipe);
                 m.video = Some(v);
                 self.announce_video_keyframe();
@@ -2032,9 +2030,9 @@ impl CallEngine {
         }
     }
 
-    /// Deactivate the video plane (downgrade): outbound AUs drop, inbound PT-97 is ignored. The
-    /// pipeline (and its SRTP send seq/ROC) is PRESERVED so a later re-upgrade continues the
-    /// keystream instead of resetting the packet index. The audio plane is untouched. Idempotent.
+    /// Stop sending and decoding video while continuing to receive carried audio.
+    /// The pipeline keeps its SRTP send sequence and ROC so enabling video again does not reuse a
+    /// packet index. The audio plane is unchanged. Idempotent.
     pub fn disable_video(&mut self) {
         if let Some(v) = self.media.as_mut().and_then(|m| m.video.as_mut()) {
             v.active = false;
@@ -2829,13 +2827,7 @@ impl CallEngine {
                     }
                     Err(error) => Err(error),
                 },
-                // No ACTIVE plane (not negotiated, or after a downgrade): the picture is dropped.
-                // Its audio is not. Whatever video the peer still sends, during an upgrade this
-                // side has not taken up or a downgrade the peer has not acted on yet, carries its
-                // speech like any other. The stream keeps ONE receive state through all of it: the
-                // inactive plane's, or before there is a plane, the one the plane adopts when it is
-                // built. A second, fresh one would lose the rollover counter at the transition and
-                // accept again every packet the first had already taken.
+                // Keep carried audio while picture decoding is inactive.
                 Some(v) => v
                     .pipe
                     .unprotect_without_picture(pkt)
