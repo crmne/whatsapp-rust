@@ -790,7 +790,13 @@ struct VideoPlaneState {
     /// leave a plane that was born requiring an IDR -- every plane is --
     /// waiting for a request nobody ever made.
     keyframe_announced: bool,
+    /// The peer stream being reassembled and the sequence number its next packet should carry.
+    inbound_expected: Option<(u32, u16)>,
 }
+
+/// A forward jump in the peer's video sequence past this is a stream that restarted its numbering,
+/// not loss: ten seconds of video at any rate a call carries.
+const MAX_VIDEO_SEQUENCE_GAP: u16 = 3000;
 
 /// Whether a peer-keyframe request may be coalesced with a recent one.
 ///
@@ -838,6 +844,35 @@ impl VideoPlaneState {
     fn forget_inbound_stream(&mut self) {
         self.pipe.reset_reassembly();
         self.peer_keyframe_asked_at = None;
+        self.inbound_expected = None;
+    }
+
+    /// How many of the peer's video packets are missing before this one, which authenticated on
+    /// `ssrc` with `sequence`.
+    ///
+    /// Only for the stream being reassembled: a straggler from a stream the peer left says nothing
+    /// about the picture on screen. A packet older than the one expected (late, or repeated)
+    /// neither counts nor moves the expectation back.
+    fn missing_before(&mut self, ssrc: u32, sequence: u16) -> u16 {
+        if self.pipe.inbound_ssrc() != Some(ssrc) {
+            return 0;
+        }
+        let missing = match self.inbound_expected {
+            Some((stream, expected)) if stream == ssrc => {
+                let ahead = sequence.wrapping_sub(expected);
+                if ahead >= 0x8000 {
+                    return 0;
+                }
+                if ahead > MAX_VIDEO_SEQUENCE_GAP {
+                    0
+                } else {
+                    ahead
+                }
+            }
+            _ => 0,
+        };
+        self.inbound_expected = Some((ssrc, sequence.wrapping_add(1)));
+        missing
     }
 }
 
@@ -875,6 +910,7 @@ fn make_video_plane(
         keyframe_required: true,
         peer_keyframe_asked_at: None,
         keyframe_announced: false,
+        inbound_expected: None,
     })
 }
 
@@ -2793,6 +2829,8 @@ impl CallEngine {
             // The audio a WhatsApp client carries inside its video in a video call. Taken out here
             // and played once the media borrow has ended.
             let mut piggybacked = None;
+            // Packets of the peer's picture that never arrived, acted on once the media borrow ends.
+            let mut video_lost = 0u16;
             // The clear extension identifies an audio arrival even when its tag fails.
             // Pure video must not keep the audio watchdog alive.
             if audio_carrier {
@@ -2809,6 +2847,7 @@ impl CallEngine {
                             now,
                             VIDEO_CLOCK_RATE,
                         );
+                        video_lost = v.missing_before(header.ssrc, header.sequence_number);
                         for (timestamp, au, orientation) in completed {
                             let keyframe = au_is_keyframe(&au);
                             self.outbox.push_back(Output::VideoPlayout(VideoFrame {
@@ -2856,6 +2895,18 @@ impl CallEngine {
             }
             if let Some(audio) = piggybacked {
                 self.on_piggybacked_audio(now, &audio);
+            }
+            if video_lost > 0 {
+                self.media_stats.video_rtp_lost = self
+                    .media_stats
+                    .video_rtp_lost
+                    .saturating_add(u32::from(video_lost));
+                // The frames after a lost packet refer to a picture the decoder never got, and a
+                // decoder conceals what it is missing rather than failing on it: without a fresh
+                // keyframe the damage stays on screen, smeared into every frame after it, until the
+                // peer happens to send one. Coalesced, so a burst of loss costs the peer one
+                // keyframe rather than one per gap.
+                self.request_peer_keyframe(now, KeyframeUrgency::Coalesced);
             }
             return;
         }
@@ -9955,6 +10006,55 @@ mod tests {
             eng.request_peer_keyframe(400, KeyframeUrgency::Coalesced),
             "the throttle belongs to the stream that ended, not to this one"
         );
+    }
+
+    /// A packet of the peer's picture that never arrives leaves every later
+    /// frame referring to one the decoder lacks, and a decoder conceals that
+    /// rather than failing on it, so the engine has to be the one to ask.
+    #[test]
+    fn a_gap_in_the_peers_video_asks_for_a_keyframe_and_is_counted() {
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let call_key = cfg.call_key.clone();
+        let local_video_ssrc = ssrc::derive_video_participant_ssrc(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.self_lid),
+        );
+        let (mut eng, mut peer_video) = video_engine_with_inbound_stream();
+        let mut packets = |count| -> Vec<Vec<u8>> {
+            (0..count)
+                .flat_map(|_| peer_video.protect_video(&video_delta_au(100)))
+                .collect()
+        };
+
+        // In order: nothing missing, nothing asked.
+        for (at, packet) in (200..).zip(packets(3)) {
+            eng.handle_input(at, Input::RelayPacket(&packet));
+        }
+        assert!(peer_keyframe_requests(&mut eng, &call_key, local_video_ssrc).is_empty());
+        assert_eq!(eng.media_stats().video_rtp_lost, 0);
+
+        // Two packets lost: counted, and one request for the picture.
+        let mut next = packets(4);
+        let late = next.remove(1);
+        next.remove(1);
+        for (at, packet) in (300..).zip(&next) {
+            eng.handle_input(at, Input::RelayPacket(packet));
+        }
+        assert_eq!(
+            peer_keyframe_requests(&mut eng, &call_key, local_video_ssrc).len(),
+            1
+        );
+        assert_eq!(eng.media_stats().video_rtp_lost, 2);
+
+        // One of them turning up late is not a new loss, and a second gap within
+        // the interval is the same burst: counted, but not asked about again.
+        eng.handle_input(400, Input::RelayPacket(&late));
+        let mut after = packets(2);
+        after.remove(0);
+        eng.handle_input(500, Input::RelayPacket(&after[0]));
+        assert!(peer_keyframe_requests(&mut eng, &call_key, local_video_ssrc).is_empty());
+        assert_eq!(eng.media_stats().video_rtp_lost, 3);
     }
 
     /// A burst of gaps describing one loss costs one request, and the next is
