@@ -694,16 +694,9 @@ type DialedRelay = (
 /// How long a relay that answered first on its advertised port is held back for the web-client
 /// port, when both are being dialled.
 ///
-/// A hypothesis, not a measured fact. A host that serves both ports completes both handshakes, a
-/// round trip or so apart and in either order, and keeping whichever finished first is suspected of
-/// leaving some calls one-way: the peer hears us and nothing comes back (issue #1098). That the
-/// advertised port carried our uplink and returned nothing on those calls has not been recorded on
-/// the same host side by side with 3480; see the connect log in `connect`, which names the port kept
-/// and why. Nor is this what WA Web does: its relay connection manager connects several candidates
-/// and dials the advertised port only when a gated option (`shouldUseOriginalRelayPort`) is on,
-/// otherwise [`WEB_CLIENT_RELAY_PORT`], with no preference window like this one. The wait is long
-/// enough to cover one DTLS retransmission, and costs time only on a host that does not answer on
-/// the web-client port at all.
+/// The preference is a local hypothesis; see [`WEB_CLIENT_RELAY_PORT`] for the evidence and limits.
+/// WA Web does not use this preference window. The wait gives the second handshake time to finish;
+/// `connect` logs which port was kept and why so a real call can test the hypothesis.
 const WEB_CLIENT_PORT_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// How far into the dial the grace may run. A relay that answers on its advertised port later than
@@ -1147,12 +1140,8 @@ mod tests {
         })
     }
 
-    // A hypothesis behind `WEB_CLIENT_PORT_GRACE`, not a reproduction: on a real call we placed, the
-    // peer heard us and saw our video while our `rtp_received` and `rtp_payload_type_unexpected`
-    // stayed at zero. Those do not show that nothing arrived: audio `rtp_received` counts only
-    // packets that pass SRTP (a failed tag counts in `srtp_unprotect_failed`), and video returns
-    // through its own branch before either. Which port had been kept was not recorded either. This
-    // pins the selection, not the cause.
+    // This pins selection policy. Media routing still needs the same-host measurement described
+    // by `WEB_CLIENT_RELAY_PORT`.
     #[tokio::test(start_paused = true)]
     async fn a_relay_serving_both_ports_is_kept_on_the_web_client_port() {
         let runtime = crate::runtime_impl::TokioRuntime;

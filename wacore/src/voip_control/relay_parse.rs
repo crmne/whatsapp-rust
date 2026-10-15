@@ -333,9 +333,15 @@ pub fn merge_relay_data(base: RelayData, patch: RelayData) -> RelayData {
     }
 }
 
-/// The port a web client's relay media rides on. Only relays answering here route a web client's
-/// media in both directions; one on 3478 completes the handshake and carries our uplink but never
-/// forwards the peer's stream back (issue #1098).
+/// The relay port WhatsApp Web uses when `shouldUseOriginalRelayPort()` is false.
+///
+/// In Web 2.3000.1047483476, `WAWebVoipSctpConnectionManager` uses the advertised port when that
+/// gate is true and this port otherwise. It connects multiple relay candidates. A successful
+/// handshake alone does not establish whether a port carries inbound media.
+///
+/// Preferring this port over an advertised port that also answers is a local hypothesis about
+/// one-way calls, not a confirmed routing requirement. It still needs a same-host comparison of
+/// both handshakes, the selected port and inbound packets before SRTP authentication.
 pub const WEB_CLIENT_RELAY_PORT: u16 = 3480;
 
 /// FNA relays (is_fna=1, auth_token_id=0) are inbound-only; not for outbound relaylatency.
@@ -359,8 +365,8 @@ pub fn get_outbound_relay_endpoints(relay_data: &RelayData) -> Vec<RelayEndpoint
 
 /// The relay endpoint to connect the MEDIA transport to.
 ///
-/// Prefer an endpoint on [`WEB_CLIENT_RELAY_PORT`], or the call goes silently one-way: the other
-/// endpoints connect and carry our uplink without ever delivering the peer's media.
+/// Prefer an endpoint on [`WEB_CLIENT_RELAY_PORT`]. See that constant for the evidence and limits
+/// behind this local preference.
 ///
 /// Below that: `auth_token_id` only gates relaylatency probes, so an offer that carries every
 /// endpoint with `auth_token_id=0` has no relaylatency candidate yet must still connect for media.
