@@ -61,7 +61,7 @@ const MEDIA_CHANNEL_TYPE: ChannelType = ChannelType::PartialReliableRexmitUnorde
 /// The retransmit count [`MEDIA_CHANNEL_TYPE`] carries: never retransmit, abandon instead.
 const MEDIA_MAX_RETRANSMITS: u32 = 0;
 
-use wacore::voip::demux::{RelayPacketKind, classify_relay_packet};
+use wacore::voip::demux::{RelayPacketKind, classify_relay_packet, unwrap_group_forwarding_packet};
 
 /// Why the media stack stopped. The driver branches on the variant: a peer close ends the call the
 /// way hanging up does, anything else is a transport failure the call surfaces as a read error.
@@ -991,7 +991,11 @@ impl InboundTally {
     }
 
     fn count(&mut self, packet: &[u8]) {
-        let slot = match classify_relay_packet(packet) {
+        // Match the engine's demux before SRTP authentication, including group media.
+        let kind = unwrap_group_forwarding_packet(packet)
+            .map(|packet| classify_relay_packet(packet.payload))
+            .unwrap_or(RelayPacketKind::Other);
+        let slot = match kind {
             RelayPacketKind::Stun => &mut self.stun,
             RelayPacketKind::Rtp => &mut self.rtp,
             RelayPacketKind::Rtcp => &mut self.rtcp,
@@ -1240,8 +1244,7 @@ mod tests {
         );
     }
 
-    /// The inbound tally sorts what the stack hands up the way `deliver` does, before the engine's
-    /// SRTP gate, so a packet that would fail its tag still counts as RTP here.
+    /// A packet that would fail its SRTP tag still counts as RTP before decryption.
     #[test]
     fn the_inbound_tally_counts_each_kind_before_decryption() {
         let mut tally = InboundTally::new(None);
@@ -1259,6 +1262,45 @@ mod tests {
         assert_eq!(
             (tally.stun, tally.rtp, tally.rtcp, tally.other),
             (1, 2, 1, 1)
+        );
+    }
+
+    #[test]
+    fn the_inbound_tally_unwraps_group_media_before_classifying() {
+        let mut tally = InboundTally::new(None);
+        for (format, header_len) in [(2, 8), (4, 12), (7, 18)] {
+            for payload_type in [120, 201] {
+                let mut packet = vec![0; header_len + 12];
+                packet[0] = 0x09;
+                packet[1] = format;
+                packet[header_len] = 0x80;
+                packet[header_len + 1] = payload_type;
+                tally.count(&packet);
+            }
+        }
+        assert_eq!(
+            (tally.stun, tally.rtp, tally.rtcp, tally.other),
+            (0, 3, 3, 0)
+        );
+    }
+
+    #[test]
+    fn the_inbound_tally_counts_malformed_group_envelopes_as_other() {
+        let mut tally = InboundTally::new(None);
+        for packet in [
+            &[0x09][..],
+            &[0x09, 3],
+            &[0x09, 2, 0, 0, 0, 0, 0, 0],
+            &[0x09, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 120],
+            &[
+                0x09, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        ] {
+            tally.count(packet);
+        }
+        assert_eq!(
+            (tally.stun, tally.rtp, tally.rtcp, tally.other),
+            (0, 0, 0, 5)
         );
     }
 
