@@ -563,6 +563,16 @@ pub struct MediaStats {
     /// reassembled. Each gap also asks the peer for a keyframe, coalesced like every request.
     #[builder(default)]
     pub video_rtp_lost: u32,
+    /// Packets of our video the peer asked for again in generic NACKs, counted per packet named.
+    ///
+    /// Zero across a call that lost video means the peer recovers some other way (a keyframe
+    /// request, or waiting for the next keyframe), which is the question this answers.
+    #[builder(default)]
+    pub video_nack_requested: u32,
+    /// Packets of our video sent again in answer to those NACKs. Fewer than requested when a packet
+    /// had already left the history or had been sent again as often as it may be.
+    #[builder(default)]
+    pub video_retransmitted: u32,
 }
 
 impl MediaStats {
