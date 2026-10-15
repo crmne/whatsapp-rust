@@ -362,10 +362,7 @@ pub struct MediaPipeline {
     /// carry its audio piggybacked. Kept apart from `recv_streams` so they cannot take a slot an
     /// audio stream needs.
     aux_recv_streams: SrtpRecvStreams,
-    /// Rollover and replay state for the peer's video while the call has no video plane yet: a peer
-    /// upgrading to video sends before this side takes the upgrade up, with its audio inside. The
-    /// plane built later takes this over ([`VideoPipeline::adopt_recv_state`]) rather than starting
-    /// the stream afresh, which would lose its rollover counter and accept its packets again.
+    /// Video receive state before a plane exists, transferred by [`VideoPipeline::adopt_recv_state`].
     video_recv_streams: SrtpRecvStreams,
     srtcp: SrtcpSender,
     recv_srtcp_keys: E2eSrtpKeys,
@@ -598,7 +595,7 @@ impl MediaPipeline {
     }
 
     /// Authenticate and decrypt one of the peer's video packets while the call has no video plane,
-    /// for the audio it carries. Its receive state is the one the plane adopts once it is built.
+    /// for the audio it carries.
     pub(crate) fn unprotect_video_without_plane(
         &mut self,
         packet: &[u8],
@@ -993,16 +990,16 @@ impl VideoPipeline {
         )
     }
 
-    /// Take over the receive state `media` kept for the peer's video before this plane existed, so
-    /// the stream continues at its rollover counter and replay window instead of starting afresh.
-    /// Both derive their recv keys from the same participant id.
+    /// Transfer video receive state collected before a plane existed. Starting fresh would lose
+    /// its rollover counter and replay window, rejecting carriers after a wrap and accepting old
+    /// carriers again.
+    /// Both pipelines derive their receive keys from the same participant id.
     pub(crate) fn adopt_recv_state(&mut self, media: &mut MediaPipeline) {
         self.recv_streams = std::mem::take(&mut media.video_recv_streams);
     }
 
     /// Authenticate and decrypt a video packet while the plane is inactive, for the audio it
-    /// carries: the picture is not reassembled, but the stream's rollover counter and replay window
-    /// advance exactly as they would with the plane active, so a later re-upgrade continues them.
+    /// carries, without reassembling the picture.
     pub(crate) fn unprotect_without_picture(
         &mut self,
         packet: &[u8],
