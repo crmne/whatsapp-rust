@@ -559,10 +559,22 @@ pub struct MediaStats {
     /// report can name the type instead of only counting it. Zero until one arrives.
     #[builder(default)]
     pub last_unexpected_payload_type: u8,
-    /// The peer's video packets that never arrived: gaps in the sequence of the stream being
-    /// reassembled. Each gap also asks the peer for a keyframe, coalesced like every request.
+    /// Forward sequence gaps observed on the peer video stream being reassembled.
+    /// Late arrivals do not subtract from this counter. Gaps request a keyframe through
+    /// the coalesced recovery path.
     #[builder(default)]
     pub video_rtp_lost: u32,
+    /// Packets of our video the peer asked for again in generic NACKs, counted per packet named.
+    ///
+    /// Zero across a call that lost video means the peer recovers some other way (a keyframe
+    /// request, or waiting for the next keyframe), which is the question this answers.
+    #[builder(default)]
+    pub video_nack_requested: u32,
+    /// Protected video packets emitted for retransmission in answer to those NACKs.
+    /// Fewer than requested when history or retry limits reject a request. Driver backpressure
+    /// and transport failures can still prevent delivery.
+    #[builder(default)]
+    pub video_retransmitted: u32,
 }
 
 impl MediaStats {

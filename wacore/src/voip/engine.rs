@@ -37,7 +37,7 @@ pub use super::media_stats::AudioSilenceReason;
 #[cfg(feature = "voip-mlow")]
 use super::mlow;
 use super::rtcp::{
-    RTCP_PT_PSFB, RtcpFeedback, RtpReceptionStats, build_whatsapp_rtcp_cname,
+    RTCP_PT_PSFB, RTCP_PT_RTPFB, RtcpFeedback, RtpReceptionStats, build_whatsapp_rtcp_cname,
     parse_sender_report_timing, summarize_rtcp,
 };
 #[cfg(feature = "voip-mlow")]
@@ -543,6 +543,8 @@ pub enum Input<'a> {
 pub enum Output {
     /// Send these bytes over the relay channel.
     Transmit(Bytes),
+    /// Resend a protected video packet without treating it as a new access unit.
+    RetransmitVideo(Bytes),
     /// Decoded PCM for the speaker (16kHz mono).
     Playout(Vec<i16>),
     /// A decrypted codec payload for an encoded audio sink.
@@ -792,11 +794,81 @@ struct VideoPlaneState {
     keyframe_announced: bool,
     /// The peer stream being reassembled and the sequence number its next packet should carry.
     inbound_expected: Option<(u32, u16)>,
+    /// A coalesced request that must survive until its throttle expires.
+    peer_keyframe_pending: Option<(u32, Millis)>,
+    /// A keyframe from the AU containing this gap is not proof of recovery.
+    inbound_gap_timestamp: Option<u32>,
+    /// Our latest video packets as they went on the wire, for the peer's NACKs.
+    sent: SentVideoHistory,
 }
 
-/// A forward jump in the peer's video sequence past this is a stream that restarted its numbering,
-/// not loss: ten seconds of video at any rate a call carries.
-const MAX_VIDEO_SEQUENCE_GAP: u16 = 3000;
+/// How many of our latest video packets are kept for retransmission: a second or more of video at
+/// the rates a call sends, which is longer than a NACK takes to come back over any path a call
+/// could hold up on.
+const SENT_VIDEO_HISTORY: usize = 512;
+/// How many times one packet is sent again. The peer asks again when a retransmission is lost too,
+/// and a bound keeps a peer that keeps asking from turning one packet into a stream of them.
+const MAX_VIDEO_RESENDS: u8 = 2;
+
+/// Our latest video packets, protected, in the order they were sent.
+///
+/// Kept protected rather than re-protected on demand: a retransmission is the same packet again,
+/// with the same sequence number and SRTP index, which a receiver that never got the first one
+/// accepts as an ordinary late arrival. Protecting it afresh would need the sequence number to
+/// move, and then it would no longer be the packet that was lost.
+#[derive(Default)]
+struct SentVideoHistory {
+    packets: VecDeque<(u16, Bytes, u8)>,
+}
+
+impl SentVideoHistory {
+    fn record(&mut self, packet: &Bytes) {
+        let Some(sequence) = packet
+            .get(2..4)
+            .map(|seq| u16::from_be_bytes([seq[0], seq[1]]))
+        else {
+            return;
+        };
+        if self.packets.len() == SENT_VIDEO_HISTORY {
+            self.packets.pop_front();
+        }
+        self.packets.push_back((sequence, packet.clone(), 0));
+    }
+
+    /// The packet with `sequence`, if it is still held and has not been sent again too often.
+    fn resend(&mut self, sequence: u16) -> Option<Bytes> {
+        let first = self.packets.front()?.0;
+        let index = usize::from(sequence.wrapping_sub(first));
+        let (held, packet, resends) = self.packets.get_mut(index)?;
+        if *held != sequence || *resends >= MAX_VIDEO_RESENDS {
+            return None;
+        }
+        *resends += 1;
+        Some(packet.clone())
+    }
+}
+
+/// The sequence numbers of `video_ssrc` the peer's generic NACKs (RFC 4585 section 6.2.1) ask for:
+/// each FCI row names one packet and, in its bitmask, the sixteen after it.
+fn nacked_video_sequences(feedback: &[RtcpFeedback], video_ssrc: u32) -> Vec<u16> {
+    let mut sequences = Vec::new();
+    for item in feedback {
+        if item.packet_type != RTCP_PT_RTPFB || item.fmt != 1 || item.media_ssrc != video_ssrc {
+            continue;
+        }
+        for row in item.fci.chunks_exact(4) {
+            let first = u16::from_be_bytes([row[0], row[1]]);
+            let following = u16::from_be_bytes([row[2], row[3]]);
+            sequences.push(first);
+            sequences.extend(
+                (0..16u16)
+                    .filter(|bit| following & (1 << bit) != 0)
+                    .map(|bit| first.wrapping_add(bit + 1)),
+            );
+        }
+    }
+    sequences
+}
 
 /// Whether a peer-keyframe request may be coalesced with a recent one.
 ///
@@ -845,6 +917,8 @@ impl VideoPlaneState {
         self.pipe.reset_reassembly();
         self.peer_keyframe_asked_at = None;
         self.inbound_expected = None;
+        self.peer_keyframe_pending = None;
+        self.inbound_gap_timestamp = None;
     }
 
     /// How many of the peer's video packets are missing before this one, which authenticated on
@@ -863,13 +937,13 @@ impl VideoPlaneState {
                 if ahead >= 0x8000 {
                     return 0;
                 }
-                if ahead > MAX_VIDEO_SEQUENCE_GAP {
-                    0
-                } else {
-                    ahead
-                }
+                ahead
             }
-            _ => 0,
+            _ => {
+                self.peer_keyframe_pending = None;
+                self.inbound_gap_timestamp = None;
+                0
+            }
         };
         self.inbound_expected = Some((ssrc, sequence.wrapping_add(1)));
         missing
@@ -911,6 +985,9 @@ fn make_video_plane(
         peer_keyframe_asked_at: None,
         keyframe_announced: false,
         inbound_expected: None,
+        peer_keyframe_pending: None,
+        inbound_gap_timestamp: None,
+        sent: SentVideoHistory::default(),
     })
 }
 
@@ -1810,6 +1887,9 @@ impl CallEngine {
                 // rate state describing the previous one goes with it --
                 // `rekey_recv` has already dropped the reassembly itself.
                 v.peer_keyframe_asked_at = None;
+                v.inbound_expected = None;
+                v.peer_keyframe_pending = None;
+                v.inbound_gap_timestamp = None;
             }
             return rekeyed;
         }
@@ -1935,6 +2015,8 @@ impl CallEngine {
     /// that authenticated video and *then* received a group update keeps this
     /// plane, so its depacketizer still names the direct stream while `on_rtp`
     /// has moved to the registry.
+    /// A coalesced request suppressed by the interval is retained for its next deadline.
+    /// The return value says whether a request was emitted now.
     pub fn request_peer_keyframe(&mut self, now: Millis, urgency: KeyframeUrgency) -> bool {
         if self.terminated || self.group.is_some() {
             return false;
@@ -1958,6 +2040,9 @@ impl CallEngine {
             && stream == inbound
             && now.saturating_sub(asked) < interval
         {
+            if urgency == KeyframeUrgency::Coalesced {
+                video.peer_keyframe_pending = Some((inbound, asked.saturating_add(interval)));
+            }
             return false;
         }
         let Some(pli) = video.pipe.picture_loss_indication() else {
@@ -1966,6 +2051,7 @@ impl CallEngine {
         // Stamped on the immediate path too: it starts a fresh interval, so a
         // burst that follows a decoder reset still coalesces.
         video.peer_keyframe_asked_at = Some((inbound, now));
+        video.peer_keyframe_pending = None;
         self.outbox.push_back(Output::Transmit(Bytes::from(pli)));
         self.media_stats.peer_keyframe_requests =
             self.media_stats.peer_keyframe_requests.saturating_add(1);
@@ -2179,6 +2265,13 @@ impl CallEngine {
         if let Some(m) = &self.media {
             next = next.min(m.playout_deadline);
             next = next.min(self.rtcp_deadline);
+            if self.group.is_none()
+                && let Some(video) = m.video.as_ref().filter(|v| v.active)
+                && let Some((stream, deadline)) = video.peer_keyframe_pending
+                && video.pipe.inbound_ssrc() == Some(stream)
+            {
+                next = next.min(deadline);
+            }
             // The health watchdog needs its own tick: its whole job is to fire when nothing else
             // is happening, so it cannot ride on a timer that inbound media drives.
             next = next.min(self.health.deadline());
@@ -2276,6 +2369,20 @@ impl CallEngine {
         if self.started && self.allocated && self.media.is_some() && now >= self.rtcp_deadline {
             self.emit_sender_reports(now, self.rtcp_wallclock_at(now));
             self.rtcp_deadline = next_tick(self.rtcp_deadline, now, RTCP_MS);
+        }
+        let keyframe_due = self.group.is_none()
+            && self
+                .media
+                .as_ref()
+                .and_then(|m| m.video.as_ref())
+                .is_some_and(|v| {
+                    v.active
+                        && v.peer_keyframe_pending.is_some_and(|(stream, deadline)| {
+                            now >= deadline && v.pipe.inbound_ssrc() == Some(stream)
+                        })
+                });
+        if keyframe_due {
+            self.request_peer_keyframe(now, KeyframeUrgency::Coalesced);
         }
         self.poll_audio_health(now);
         self.retransmit_group_reactions(now);
@@ -2690,6 +2797,24 @@ impl CallEngine {
                 newly_needs_keyframe = true;
                 video.keyframe_required = true;
             }
+            // The peer lost some of our video and asks for it again. Answered while video is on
+            // the wire; a gated or downgraded plane has nothing it may send.
+            if let Some(video_ssrc) = video_ssrc
+                && let Some(video) = m.video.as_mut()
+            {
+                for sequence in nacked_video_sequences(&summary.feedback, video_ssrc) {
+                    self.media_stats.video_nack_requested =
+                        self.media_stats.video_nack_requested.saturating_add(1);
+                    if video.active
+                        && !video.send_gated
+                        && let Some(packet) = video.sent.resend(sequence)
+                    {
+                        self.media_stats.video_retransmitted =
+                            self.media_stats.video_retransmitted.saturating_add(1);
+                        self.outbox.push_back(Output::RetransmitVideo(packet));
+                    }
+                }
+            }
             if let Some((sender, ntp_seconds, ntp_fraction)) = parse_sender_report_timing(&plain) {
                 m.audio_reception
                     .observe_sender_report(sender, ntp_seconds, ntp_fraction, now);
@@ -2848,8 +2973,18 @@ impl CallEngine {
                             VIDEO_CLOCK_RATE,
                         );
                         video_lost = v.missing_before(header.ssrc, header.sequence_number);
+                        if video_lost > 0 {
+                            v.inbound_gap_timestamp = Some(header.timestamp);
+                        }
                         for (timestamp, au, orientation) in completed {
                             let keyframe = au_is_keyframe(&au);
+                            if keyframe
+                                && v.inbound_gap_timestamp
+                                    .is_none_or(|gap| (timestamp.wrapping_sub(gap) as i32) > 0)
+                            {
+                                v.peer_keyframe_pending = None;
+                                v.inbound_gap_timestamp = None;
+                            }
                             self.outbox.push_back(Output::VideoPlayout(VideoFrame {
                                 data: au,
                                 keyframe,
@@ -2901,11 +3036,8 @@ impl CallEngine {
                     .media_stats
                     .video_rtp_lost
                     .saturating_add(u32::from(video_lost));
-                // The frames after a lost packet refer to a picture the decoder never got, and a
-                // decoder conceals what it is missing rather than failing on it: without a fresh
-                // keyframe the damage stays on screen, smeared into every frame after it, until the
-                // peer happens to send one. Coalesced, so a burst of loss costs the peer one
-                // keyframe rather than one per gap.
+                // A missing reference picture can damage later frames without a decoder error.
+                // Recover through the same coalesced path as the application's requests.
                 self.request_peer_keyframe(now, KeyframeUrgency::Coalesced);
             }
             return;
@@ -3915,8 +4047,15 @@ impl CallEngine {
         }
         v.keyframe_required = false;
         v.keyframe_announced = false;
+        // A group call's packets belong to one SRTP epoch, which a rekey retires; only a 1:1
+        // call answers NACKs, so only it keeps them.
+        let answers_nacks = self.group.is_none();
         for packet in packets {
-            self.outbox.push_back(Output::Transmit(Bytes::from(packet)));
+            let packet = Bytes::from(packet);
+            if answers_nacks {
+                v.sent.record(&packet);
+            }
+            self.outbox.push_back(Output::Transmit(packet));
         }
     }
 }
@@ -10008,9 +10147,8 @@ mod tests {
         );
     }
 
-    /// A packet of the peer's picture that never arrives leaves every later
-    /// frame referring to one the decoder lacks, and a decoder conceals that
-    /// rather than failing on it, so the engine has to be the one to ask.
+    /// A missing reference picture need not produce a decoder error, so sequence gaps
+    /// also drive recovery.
     #[test]
     fn a_gap_in_the_peers_video_asks_for_a_keyframe_and_is_counted() {
         let mut cfg = config(true);
@@ -10055,6 +10193,130 @@ mod tests {
         eng.handle_input(500, Input::RelayPacket(&after[0]));
         assert!(peer_keyframe_requests(&mut eng, &call_key, local_video_ssrc).is_empty());
         assert_eq!(eng.media_stats().video_rtp_lost, 3);
+    }
+
+    fn receive_after_video_gap(
+        eng: &mut CallEngine,
+        peer: &mut VideoPipeline,
+        gap: usize,
+        now: Millis,
+    ) {
+        for _ in 0..gap {
+            peer.protect_video(&video_delta_au(100));
+        }
+        for packet in peer.protect_video(&video_delta_au(100)) {
+            eng.handle_input(now, Input::RelayPacket(&packet));
+        }
+    }
+
+    #[test]
+    fn a_large_video_gap_still_counts_and_requests_recovery() {
+        let (mut eng, mut peer) = video_engine_with_inbound_stream();
+        receive_after_video_gap(&mut eng, &mut peer, 3001, 200);
+        assert_eq!(eng.media_stats().video_rtp_lost, 3001);
+        assert_eq!(eng.media_stats().peer_keyframe_requests, 1);
+        receive_after_video_gap(&mut eng, &mut peer, 0, 300);
+        assert_eq!(eng.media_stats().video_rtp_lost, 3001);
+    }
+
+    #[test]
+    fn suppressed_video_loss_requests_recovery_on_the_timer() {
+        let (mut eng, mut peer) = video_engine_with_inbound_stream();
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+        for packet in peer.protect_video(&video_au(100)) {
+            eng.handle_input(300, Input::RelayPacket(&packet));
+        }
+        receive_after_video_gap(&mut eng, &mut peer, 1, 400);
+        assert_eq!(eng.media_stats().peer_keyframe_requests, 1);
+        let pending = eng
+            .media
+            .as_ref()
+            .unwrap()
+            .video
+            .as_ref()
+            .unwrap()
+            .peer_keyframe_pending;
+        assert_eq!(pending.map(|(_, at)| at), Some(1200));
+        // Remove other clocks so poll_timeout must expose the recovery deadline itself.
+        eng.keepalive_deadline = NEVER;
+        eng.rtcp_deadline = NEVER;
+        eng.media.as_mut().unwrap().playout_deadline = NEVER;
+        eng.health = AudioHealthWatch::default();
+        assert_eq!(eng.poll_timeout(), Some(1200));
+        eng.handle_input(1199, Input::Timeout);
+        assert_eq!(eng.media_stats().peer_keyframe_requests, 1);
+        eng.handle_input(1200, Input::Timeout);
+        assert_eq!(eng.media_stats().peer_keyframe_requests, 2);
+        eng.handle_input(2200, Input::Timeout);
+        assert_eq!(
+            eng.media_stats().peer_keyframe_requests,
+            2,
+            "one pending loss causes one retry"
+        );
+    }
+
+    #[test]
+    fn a_later_keyframe_cancels_pending_video_recovery() {
+        let (mut eng, mut peer) = video_engine_with_inbound_stream();
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+        receive_after_video_gap(&mut eng, &mut peer, 1, 300);
+        for packet in peer.protect_video(&video_au(100)) {
+            eng.handle_input(400, Input::RelayPacket(&packet));
+        }
+        assert!(
+            eng.media
+                .as_ref()
+                .unwrap()
+                .video
+                .as_ref()
+                .unwrap()
+                .peer_keyframe_pending
+                .is_none()
+        );
+        eng.handle_input(1200, Input::Timeout);
+        assert_eq!(eng.media_stats().peer_keyframe_requests, 1);
+    }
+
+    #[test]
+    fn video_gap_tracking_handles_wrap_and_does_not_move_back_for_late_packets() {
+        let (mut eng, _) = video_engine_with_inbound_stream();
+        let video = eng.media.as_mut().unwrap().video.as_mut().unwrap();
+        let stream = video.pipe.inbound_ssrc().unwrap();
+        video.inbound_expected = Some((stream, u16::MAX));
+        assert_eq!(video.missing_before(stream, 0), 1);
+        assert_eq!(video.missing_before(stream, u16::MAX), 0);
+        assert_eq!(video.missing_before(stream, 1), 0);
+        assert_eq!(video.missing_before(stream, 3003), 3001);
+    }
+
+    #[test]
+    fn downgrading_video_cancels_a_suppressed_recovery_request() {
+        let (mut eng, mut peer) = video_engine_with_inbound_stream();
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+        receive_after_video_gap(&mut eng, &mut peer, 1, 300);
+        eng.disable_video();
+        assert!(eng.enable_video());
+        eng.handle_input(1200, Input::Timeout);
+        assert_eq!(eng.media_stats().peer_keyframe_requests, 1);
+        receive_after_video_gap(&mut eng, &mut peer, 0, 1300);
+        assert_eq!(eng.media_stats().video_rtp_lost, 1);
+    }
+
+    #[test]
+    fn a_rekey_forgets_sequence_expectation_and_pending_recovery() {
+        let (mut eng, mut peer) = video_engine_with_inbound_stream();
+        receive_after_video_gap(&mut eng, &mut peer, 100, 200);
+        receive_after_video_gap(&mut eng, &mut peer, 1, 300);
+        let before = eng.media_stats().video_rtp_lost;
+        assert!(eng.rekey_recv(PEER_LID));
+        let video = eng.media.as_ref().unwrap().video.as_ref().unwrap();
+        assert!(video.inbound_expected.is_none());
+        assert!(video.peer_keyframe_pending.is_none());
+        let mut restarted = peer_video_pipe();
+        receive_after_video_gap(&mut eng, &mut restarted, 0, 400);
+        receive_after_video_gap(&mut eng, &mut restarted, 1, 500);
+        assert_eq!(eng.media_stats().video_rtp_lost, before + 1);
+        assert_eq!(eng.media_stats().peer_keyframe_requests, 2);
     }
 
     /// A burst of gaps describing one loss costs one request, and the next is
@@ -10344,6 +10606,127 @@ mod tests {
             1,
             "forged feedback must not re-arm keyframe recovery"
         );
+    }
+
+    #[test]
+    fn a_nack_for_our_video_sends_the_same_packets_again() {
+        use crate::voip::e2e_srtp::{derive_srtcp_keys, protect_srtcp};
+
+        let mut cfg = config(true);
+        cfg.enable_video = true;
+        let call_key = cfg.call_key.clone();
+        let video_ssrc = ssrc::derive_video_participant_ssrc(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.self_lid),
+        );
+        let peer_ssrc = ssrc::derive_wasm_participant_ssrc(
+            &cfg.call_id,
+            &ssrc::format_e2e_srtp_participant_id(&cfg.peer_lid),
+            0,
+        );
+        let peer_keys = derive_srtcp_keys(&call_key, PEER_LID).unwrap();
+        let mut srtcp_index = 0;
+        let mut nack = |byte0: u8, rows: &[(u16, u16)]| {
+            let mut packet = vec![byte0, RTCP_PT_RTPFB, 0, 2 + rows.len() as u8];
+            packet.extend_from_slice(&peer_ssrc.to_be_bytes());
+            packet.extend_from_slice(&video_ssrc.to_be_bytes());
+            for (first, following) in rows {
+                packet.extend_from_slice(&first.to_be_bytes());
+                packet.extend_from_slice(&following.to_be_bytes());
+            }
+            if byte0 & 0x20 != 0 {
+                packet[3] += 1;
+                packet.extend_from_slice(&[0, 0, 0, 4]);
+            }
+            srtcp_index += 1;
+            protect_srtcp(&peer_keys, peer_ssrc, srtcp_index, &packet)
+        };
+        let video_packets = |outs: &[Output]| -> Vec<Bytes> {
+            outs.iter()
+                .filter_map(|output| match output {
+                    Output::Transmit(packet) | Output::RetransmitVideo(packet)
+                        if parse_rtp_header(packet)
+                            .is_some_and(|h| h.payload_type == RTP_PAYLOAD_TYPE_H264) =>
+                    {
+                        Some(packet.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let mut eng = CallEngine::new(cfg, Box::new(SequentialTxIds::new())).unwrap();
+        eng.start(0, 0);
+        let _ = drain(&mut eng);
+        eng.handle_input(1, Input::VideoFrame(&video_au(4000)));
+        let sent = video_packets(&drain(&mut eng).0);
+        assert!(sent.len() >= 4, "the keyframe spans several packets");
+        let seq = |packet: &Bytes| parse_rtp_header(packet).unwrap().sequence_number;
+
+        // The second packet, the one after it through the bitmask, and one never sent. Sent on the
+        // native video profile, which sets bit 4 beside the FMT.
+        let never_sent = seq(&sent[0]).wrapping_sub(100);
+        eng.handle_input(
+            2,
+            Input::RelayPacket(&nack(0x91, &[(seq(&sent[1]), 0b1), (never_sent, 0)])),
+        );
+        let resent = video_packets(&drain(&mut eng).0);
+        assert_eq!(
+            resent,
+            [sent[1].clone(), sent[2].clone()],
+            "the very packets that were lost, byte for byte"
+        );
+        let stats = eng.media_stats();
+        assert_eq!(stats.video_nack_requested, 3);
+        assert_eq!(stats.video_retransmitted, 2);
+
+        // A packet is sent again at most twice, however often the peer asks.
+        for at in 3..6 {
+            eng.handle_input(at, Input::RelayPacket(&nack(0x81, &[(seq(&sent[1]), 0)])));
+        }
+        assert_eq!(video_packets(&drain(&mut eng).0), [sent[1].clone()]);
+        assert_eq!(eng.media_stats().video_retransmitted, 3);
+        eng.handle_input(6, Input::RelayPacket(&nack(0xb1, &[(seq(&sent[2]), 0)])));
+        assert_eq!(video_packets(&drain(&mut eng).0), [sent[2].clone()]);
+        assert_eq!(
+            eng.media_stats().video_nack_requested,
+            7,
+            "padding is not another request"
+        );
+        eng.gate_video_outbound();
+        eng.handle_input(7, Input::RelayPacket(&nack(0x91, &[(seq(&sent[3]), 0)])));
+        assert!(video_packets(&drain(&mut eng).0).is_empty());
+        eng.disable_video();
+        eng.handle_input(8, Input::RelayPacket(&nack(0x91, &[(seq(&sent[3]), 0)])));
+        assert!(video_packets(&drain(&mut eng).0).is_empty());
+        assert_eq!(eng.media_stats().video_nack_requested, 9);
+        assert_eq!(eng.media_stats().video_retransmitted, 4);
+    }
+
+    #[test]
+    fn nacks_name_the_packets_their_bitmask_follows_on_our_stream_only() {
+        let video_ssrc = 0x1122_3344;
+        let nack = |media_ssrc, fci: &[u8]| RtcpFeedback {
+            packet_type: RTCP_PT_RTPFB,
+            fmt: 1,
+            sender_ssrc: 0x99aa_bbcc,
+            media_ssrc,
+            fci: fci.to_vec(),
+        };
+        // 65535, then bits 0 and 15: the two packets either side of the wrap and the last one.
+        assert_eq!(
+            nacked_video_sequences(&[nack(video_ssrc, &[0xff, 0xff, 0x80, 0x01])], video_ssrc),
+            [65535, 0, 15]
+        );
+        assert!(
+            nacked_video_sequences(&[nack(0x5566_7788, &[0, 1, 0, 0])], video_ssrc).is_empty(),
+            "a NACK about another stream is not ours to answer"
+        );
+        let pli = RtcpFeedback {
+            packet_type: RTCP_PT_PSFB,
+            ..nack(video_ssrc, &[0, 1, 0, 0])
+        };
+        assert!(nacked_video_sequences(&[pli], video_ssrc).is_empty());
     }
 
     #[test]
