@@ -499,6 +499,7 @@ pub struct MediaStats {
     pub rtp_received: u32,
     #[builder(default)]
     pub rtp_payload_type_unexpected: u32,
+    /// Audio SRTP failures, including video carriers that advertise piggybacked audio.
     #[builder(default)]
     pub srtp_unprotect_failed: u32,
     #[builder(default)]
