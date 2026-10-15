@@ -559,6 +559,10 @@ pub struct MediaStats {
     /// report can name the type instead of only counting it. Zero until one arrives.
     #[builder(default)]
     pub last_unexpected_payload_type: u8,
+    /// The peer's video packets that never arrived: gaps in the sequence of the stream being
+    /// reassembled. Each gap also asks the peer for a keyframe, coalesced like every request.
+    #[builder(default)]
+    pub video_rtp_lost: u32,
 }
 
 impl MediaStats {
