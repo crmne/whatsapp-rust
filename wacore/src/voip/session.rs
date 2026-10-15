@@ -585,8 +585,11 @@ impl MediaPipeline {
     /// is what the peer protects all of its streams with, but its own per-SSRC replay state.
     ///
     /// The point is the audio such a packet can carry piggybacked; the caller splits it off.
-    pub(crate) fn unprotect_auxiliary(&mut self, packet: &[u8]) -> Option<(RtpHeader, Vec<u8>)> {
-        unprotect_srtp_packet(
+    pub(crate) fn unprotect_auxiliary(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<(RtpHeader, Vec<u8>), SrtpReceiveError> {
+        unprotect_srtp_packet_checked(
             &self.recv_keys,
             &mut self.aux_recv_streams,
             self.warp_mi_tag_len,
