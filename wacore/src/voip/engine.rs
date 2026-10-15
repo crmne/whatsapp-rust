@@ -2785,13 +2785,18 @@ impl CallEngine {
         let Some(m) = self.media.as_mut() else {
             return;
         };
+        let payload_len = super::rtp::rtp_header_byte_length(pkt)
+            .and_then(|header_len| pkt.len().checked_sub(header_len))
+            .and_then(|len| len.checked_sub(m.warp_mi_tag_len));
+        let audio_carrier = parse_whatsapp_audio_piggyback_offset(pkt)
+            .zip(payload_len)
+            .is_some_and(|(offset, len)| offset > 0 && offset < len);
         if wire_header.payload_type == RTP_PAYLOAD_TYPE_H264 {
             // The audio a WhatsApp client carries inside its video in a video call. Taken out here
             // and played once the media borrow has ended.
             let mut piggybacked = None;
             // The clear extension identifies an audio arrival even when its tag fails.
             // Pure video must not keep the audio watchdog alive.
-            let audio_carrier = parse_whatsapp_audio_piggyback_offset(pkt).is_some();
             if audio_carrier {
                 self.health.media_started(now);
                 self.health.on_rtp(now);
@@ -2895,12 +2900,19 @@ impl CallEngine {
             // here too, under the same keys, and in a video call they carry its audio piggybacked
             // just as its video does.
             let mut piggybacked = None;
-            if let Some((_, mut payload)) = m.pipe.unprotect_auxiliary(pkt) {
-                self.media_stats.auxiliary_rtp_authenticated = self
-                    .media_stats
-                    .auxiliary_rtp_authenticated
-                    .saturating_add(1);
-                piggybacked = split_whatsapp_audio_piggyback(pkt, &mut payload);
+            match m.pipe.unprotect_auxiliary(pkt) {
+                Ok((_, mut payload)) => {
+                    self.media_stats.auxiliary_rtp_authenticated = self
+                        .media_stats
+                        .auxiliary_rtp_authenticated
+                        .saturating_add(1);
+                    piggybacked = split_whatsapp_audio_piggyback(pkt, &mut payload);
+                }
+                Err(SrtpReceiveError::AuthenticationFailed) if audio_carrier => {
+                    self.media_stats.srtp_unprotect_failed =
+                        self.media_stats.srtp_unprotect_failed.saturating_add(1);
+                }
+                _ => {}
             }
             if let Some(audio) = piggybacked {
                 // This packet was already counted as an arrival above.
@@ -12089,7 +12101,12 @@ mod tests {
 
     #[test]
     fn failed_audio_carriers_report_authentication_failure() {
-        for state in 0..3 {
+        for (payload_type, state) in [
+            (RTP_PAYLOAD_TYPE_H264, 0),
+            (RTP_PAYLOAD_TYPE_H264, 1),
+            (RTP_PAYLOAD_TYPE_H264, 2),
+            (98, 0),
+        ] {
             let mut eng = allocated_video_engine(CallDirection::Incoming);
             if state == 1 {
                 eng.disable_video();
@@ -12105,7 +12122,7 @@ mod tests {
                     &[0x50, 1, 2],
                 );
                 let mut packet = peer_packet_carrying_audio(
-                    RTP_PAYLOAD_TYPE_H264,
+                    payload_type,
                     peer_video_ssrc(),
                     n,
                     &[0x65, 1, 2, 3],
@@ -12135,24 +12152,53 @@ mod tests {
 
     #[test]
     fn pure_video_does_not_hide_an_audio_stall() {
-        let mut eng = allocated_video_engine(CallDirection::Incoming);
-        let mut peer = peer_video_pipe();
-        let mut events = Vec::new();
-        for n in 0..80u64 {
-            let mut packet = peer.protect_video(&video_au(100)).pop().unwrap();
-            *packet.last_mut().unwrap() ^= 1;
-            let now = n * 60 + 1;
-            eng.handle_input(now, Input::RelayPacket(&packet));
-            events.extend(drain(&mut eng).0);
-            eng.handle_input(now + 60, Input::Timeout);
-            events.extend(drain(&mut eng).0);
+        for offset in [None, Some(0u16), Some(4), Some(5)] {
+            let mut eng = allocated_video_engine(CallDirection::Incoming);
+            let mut peer = peer_video_pipe();
+            let mut events = Vec::new();
+            for n in 0..80u16 {
+                let mut packet = if let Some(offset) = offset {
+                    let mut packet = peer_packet_carrying_audio(
+                        RTP_PAYLOAD_TYPE_H264,
+                        peer_video_ssrc(),
+                        n,
+                        &[0x65, 1, 2, 3],
+                        &[],
+                    );
+                    packet[19..21].copy_from_slice(&offset.to_be_bytes());
+                    packet
+                } else {
+                    peer.protect_video(&video_au(100)).pop().unwrap()
+                };
+                *packet.last_mut().unwrap() ^= 1;
+                let now = u64::from(n) * 60 + 1;
+                eng.handle_input(now, Input::RelayPacket(&packet));
+                events.extend(drain(&mut eng).0);
+                eng.handle_input(now + 60, Input::Timeout);
+                events.extend(drain(&mut eng).0);
+            }
+            assert!(
+                events
+                    .iter()
+                    .any(|o| matches!(o, Output::Event(CallEvent::AudioReceptionStalled { .. })))
+            );
+            assert_eq!(eng.media_stats().srtp_unprotect_failed, 0);
+            assert_eq!(eng.media_stats().video_srtp_unprotect_failed, 80);
         }
-        assert!(
-            events
-                .iter()
-                .any(|o| matches!(o, Output::Event(CallEvent::AudioReceptionStalled { .. })))
-        );
+    }
+
+    #[test]
+    fn replayed_auxiliary_audio_is_not_an_authentication_failure() {
+        let mut eng = allocated_engine();
+        let tone = mlow_tone_frames(1).pop().unwrap();
+        let audio = plain_peer_audio(crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE, 7, &tone);
+        let packet = peer_packet_carrying_audio(98, peer_video_ssrc(), 1, &[0x65, 1, 2, 3], &audio);
+        for now in [2, 3] {
+            eng.handle_input(now, Input::RelayPacket(&packet));
+            let _ = drain(&mut eng);
+        }
+        assert_eq!(eng.media_stats().auxiliary_rtp_authenticated, 1);
+        assert_eq!(eng.media_stats().piggybacked_audio_received, 1);
         assert_eq!(eng.media_stats().srtp_unprotect_failed, 0);
-        assert_eq!(eng.media_stats().video_srtp_unprotect_failed, 80);
     }
 }
