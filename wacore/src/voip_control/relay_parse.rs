@@ -711,15 +711,15 @@ mod tests {
         }
     }
 
-    /// Selecting by tier alone picks the lowest-RTT non-FNA endpoint, which is the one-way silent
-    /// case from issue #1098.
+    /// Pins the local endpoint preference documented at [`WEB_CLIENT_RELAY_PORT`].
+    /// This test does not establish whether either port carries inbound media.
     #[test]
     fn media_relay_prefers_the_web_client_port_endpoint() {
         let rd = live_outgoing_relay();
         let selected = get_media_relay_endpoint(&rd).expect("an endpoint must be selectable");
         assert_eq!(
             selected.relay_name, "fimp3c01",
-            "must dial the relay listening on the web client port, not the lowest-RTT non-FNA one"
+            "selection follows the local preference documented at WEB_CLIENT_RELAY_PORT"
         );
         assert_eq!(
             get_primary_ipv4_address(selected),
