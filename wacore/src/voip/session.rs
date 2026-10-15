@@ -548,7 +548,14 @@ impl MediaPipeline {
     /// into the rollover counter and permanently desync the receiver (RFC 3711
     /// §3.3.1 requires the index update to follow authentication).
     pub fn unprotect_audio(&mut self, packet: &[u8]) -> Option<(RtpHeader, Vec<u8>)> {
-        unprotect_srtp_packet(
+        self.unprotect_audio_checked(packet).ok()
+    }
+
+    pub(crate) fn unprotect_audio_checked(
+        &mut self,
+        packet: &[u8],
+    ) -> Result<(RtpHeader, Vec<u8>), SrtpReceiveError> {
+        unprotect_srtp_packet_checked(
             &self.recv_keys,
             &mut self.recv_streams,
             self.warp_mi_tag_len,
@@ -651,15 +658,6 @@ pub(crate) enum SrtpReceiveError {
     AuthenticationFailed,
     /// Replay window or stream capacity rejected an authenticated packet.
     Rejected,
-}
-
-fn unprotect_srtp_packet(
-    recv_keys: &E2eSrtpKeys,
-    recv_streams: &mut SrtpRecvStreams,
-    warp_mi_tag_len: usize,
-    packet: &[u8],
-) -> Option<(RtpHeader, Vec<u8>)> {
-    unprotect_srtp_packet_checked(recv_keys, recv_streams, warp_mi_tag_len, packet).ok()
 }
 
 /// Shared inbound SRTP step for the audio and video pipelines: verify the WARP
