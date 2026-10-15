@@ -2912,14 +2912,18 @@ impl CallEngine {
             }
             return;
         }
-        let Some((header, payload)) = m.pipe.unprotect_audio(pkt) else {
-            // Wrong recv keys, wrong peer LID or a desynced ROC all land here, and every one of
-            // them makes the call totally deaf with no other symptom.
-            self.media_stats.srtp_unprotect_failed =
-                self.media_stats.srtp_unprotect_failed.saturating_add(1);
-            return;
-        };
-        self.on_audio_rtp(now, header, payload);
+        match m.pipe.unprotect_audio_checked(pkt) {
+            Ok((header, payload)) => self.on_audio_rtp(now, header, payload),
+            Err(SrtpReceiveError::AuthenticationFailed) => {
+                self.media_stats.srtp_unprotect_failed =
+                    self.media_stats.srtp_unprotect_failed.saturating_add(1);
+            }
+            Err(SrtpReceiveError::InvalidPacket) => {
+                self.media_stats.relay_packet_unclassified =
+                    self.media_stats.relay_packet_unclassified.saturating_add(1);
+            }
+            Err(SrtpReceiveError::Rejected) => {}
+        }
     }
 
     /// One audio RTP packet the peer carried inside another of its packets.
@@ -12192,5 +12196,35 @@ mod tests {
         assert_eq!(eng.media_stats().auxiliary_rtp_authenticated, 1);
         assert_eq!(eng.media_stats().piggybacked_audio_received, 1);
         assert_eq!(eng.media_stats().srtp_unprotect_failed, 0);
+    }
+
+    #[test]
+    fn carried_audio_before_standalone_is_not_an_authentication_failure() {
+        for payload_type in [RTP_PAYLOAD_TYPE_H264, 98] {
+            let mut eng = allocated_engine();
+            let tone = mlow_tone_frames(1).pop().unwrap();
+            let audio =
+                plain_peer_audio(crate::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_SEPARATE, 7, &tone);
+            let carrier = peer_packet_carrying_audio(
+                payload_type,
+                peer_video_ssrc(),
+                1,
+                &[0x65, 1, 2, 3],
+                &audio,
+            );
+            eng.handle_input(2, Input::RelayPacket(&carrier));
+            let _ = drain(&mut eng);
+            let samples = eng.jitter_len();
+            assert!(samples > 0);
+            let standalone = peer_audio_at_roc(7, 0, &tone);
+            for now in [3, 4] {
+                eng.handle_input(now, Input::RelayPacket(&standalone));
+                let _ = drain(&mut eng);
+            }
+            assert_eq!(eng.jitter_len(), samples);
+            assert_eq!(eng.media_stats().piggybacked_audio_received, 1);
+            assert_eq!(eng.media_stats().rtp_received, 1);
+            assert_eq!(eng.media_stats().srtp_unprotect_failed, 0);
+        }
     }
 }
