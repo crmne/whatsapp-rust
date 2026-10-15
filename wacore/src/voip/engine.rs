@@ -2978,7 +2978,9 @@ impl CallEngine {
                         }
                         for (timestamp, au, orientation) in completed {
                             let keyframe = au_is_keyframe(&au);
+                            // Parameter sets are sync metadata, not a repaired picture.
                             if keyframe
+                                && au_has_idr(&au)
                                 && v.inbound_gap_timestamp
                                     .is_none_or(|gap| (timestamp.wrapping_sub(gap) as i32) > 0)
                             {
@@ -10252,6 +10254,34 @@ mod tests {
             eng.media_stats().peer_keyframe_requests,
             2,
             "one pending loss causes one retry"
+        );
+    }
+
+    #[test]
+    fn parameter_sets_do_not_cancel_pending_video_recovery() {
+        let (mut eng, mut peer) = video_engine_with_inbound_stream();
+        assert!(eng.request_peer_keyframe(200, KeyframeUrgency::Coalesced));
+        receive_after_video_gap(&mut eng, &mut peer, 1, 300);
+        let parameters = [0, 0, 0, 1, 0x67, 0x42, 0, 0x1e, 0, 0, 0, 1, 0x68, 0xce];
+        assert!(au_is_keyframe(&parameters));
+        assert!(!au_has_idr(&parameters));
+        let packets = peer.protect_video(&parameters);
+        assert!(!packets.is_empty());
+        for packet in packets {
+            eng.handle_input(400, Input::RelayPacket(&packet));
+        }
+        let (outputs, _) = drain(&mut eng);
+        assert!(
+            outputs.iter().any(|out| matches!(out,
+                Output::VideoPlayout(frame) if frame.keyframe && !au_has_idr(&frame.data)
+            )),
+            "parameter sets reached the application's video sink"
+        );
+        eng.handle_input(1200, Input::Timeout);
+        assert_eq!(
+            eng.media_stats().peer_keyframe_requests,
+            2,
+            "parameter sets cannot repair the missing reference picture"
         );
     }
 
