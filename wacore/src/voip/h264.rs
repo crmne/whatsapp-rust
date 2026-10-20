@@ -409,8 +409,8 @@ pub struct H264DepacketizerStats {
     /// Timestamps whose packets left no complete NAL by the time the next
     /// timestamp began: a picture that produced nothing at all.
     pub access_units_empty: u32,
-    /// Completed access units dropped from the ready queue to keep it at
-    /// [`H264_MAX_READY_AUS`].
+    /// Completed access units dropped from the ready queue, which holds at most
+    /// four.
     pub access_units_evicted: u32,
     /// Packets discarded because their timestamp is older than the access unit
     /// being assembled or the one last completed.
@@ -598,17 +598,23 @@ impl H264Depacketizer {
             NAL_TYPE_STAP_A => {
                 self.drop_partial_fu(FuDrop::Unterminated);
                 let mut rest = &payload[1..];
+                let mut appended = false;
+                let mut malformed = false;
                 while rest.len() >= 2 {
                     let len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
                     rest = &rest[2..];
                     if len == 0 || len > rest.len() {
+                        malformed = true;
                         break;
                     }
                     let (nal, tail) = rest.split_at(len);
                     self.append_nal(nal);
+                    appended = true;
                     rest = tail;
                 }
-                if !rest.is_empty() {
+                // A header alone, a zero or lying length, or a stray trailing byte: the packet
+                // carried something it could not deliver.
+                if malformed || !appended || !rest.is_empty() {
                     self.note_unusable_payload();
                 }
             }
@@ -1503,17 +1509,20 @@ mod tests {
     #[test]
     fn stats_count_unusable_payloads() {
         let mut d = H264Depacketizer::default();
-        let unusable: [&[u8]; 5] = [
+        let unusable: [&[u8]; 8] = [
             &[],
             &[0x00, 0x01],
             &[0x7c],                   // FU-A with no header
             &[0x7d, 0x80, 0x01],       // FU-B
             &[0x78, 0x00, 0xff, 0xaa], // STAP-A with a lying length
+            &[0x78],                   // STAP-A header alone
+            &[0x78, 0x00, 0x05],       // STAP-A length with no bytes after it
+            &[0x78, 0x00, 0x00],       // STAP-A with a zero length
         ];
         for (seq, payload) in unusable.iter().enumerate() {
             let _ = d.push(seq as u16, 1000, payload, false);
         }
-        assert_eq!(d.take_stats().payload_unusable, 5);
+        assert_eq!(d.take_stats().payload_unusable, 8);
         // A well-formed STAP-A is not.
         let mut stap = vec![0x78];
         for n in [nal(7, 6), nal(8, 4)] {
