@@ -2972,6 +2972,8 @@ impl CallEngine {
                             now,
                             VIDEO_CLOCK_RATE,
                         );
+                        v.reception
+                            .count_payload(header.ssrc, payload_len.unwrap_or(0));
                         video_lost = v.missing_before(header.ssrc, header.sequence_number);
                         if video_lost > 0 {
                             v.inbound_gap_timestamp = Some(header.timestamp);
@@ -3183,6 +3185,7 @@ impl CallEngine {
             now,
             m.audio.format.rtp_clock_rate,
         );
+        m.audio_reception.count_payload(header.ssrc, payload.len());
         // Set when the payload reaching the codec is ciphertext whose tag did not authenticate. Such
         // bytes are passed through by contract but they are NOT evidence about anything: they are
         // whatever the wrong key produced, and three of them structurally resembling 60ms Opus would
