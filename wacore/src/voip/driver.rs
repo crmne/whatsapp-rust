@@ -1377,6 +1377,7 @@ async fn run_call_with_clock_and_wallclock(
                     Ok(VideoControl::SetTimestampStride(ts_stride)) => {
                         let _ = eng.set_video_timestamp_stride(ts_stride);
                     }
+                    Ok(VideoControl::SetFec(config)) => eng.set_video_fec(config),
                     Ok(VideoControl::Enable) => {
                         // False only for a control-only engine or a malformed stored callKey; the
                         // audio plane already validated the key, so treat it as a no-op not fatal.

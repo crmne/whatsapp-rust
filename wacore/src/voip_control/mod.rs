@@ -452,6 +452,8 @@ pub enum MediaCommand {
     SetVideoInputGeneration(u64),
     /// RTP clock increment per access unit.
     SetVideoTimestampStride(u32),
+    /// How much forward error correction our video carries in a 1:1 call.
+    SetVideoFec(VideoFecConfig),
     /// Caller-only: rekey the recv path to the device that answered, and apply the audio codec its
     /// capability selected in the same step. The two travel together because rekeying decides which
     /// keys decrypt the next packet, and the codec decides how it is decoded.
