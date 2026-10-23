@@ -333,6 +333,72 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
         // NOT a delta: the flap limit is a property of the whole call, and a probe that has latched
         // stays latched. Resetting it per window would let a thrashing call look settled.
         codec_switches: now.codec_switches,
+        video_rtp_received: now
+            .video_rtp_received
+            .saturating_sub(then.video_rtp_received),
+        video_srtp_unprotect_failed: now
+            .video_srtp_unprotect_failed
+            .saturating_sub(then.video_srtp_unprotect_failed),
+        piggybacked_audio_received: now
+            .piggybacked_audio_received
+            .saturating_sub(then.piggybacked_audio_received),
+        auxiliary_rtp_authenticated: now
+            .auxiliary_rtp_authenticated
+            .saturating_sub(then.auxiliary_rtp_authenticated),
+        // NOT a delta either: it names a type, it does not count one.
+        last_unexpected_payload_type: now.last_unexpected_payload_type,
+        video_rtp_lost: now.video_rtp_lost.saturating_sub(then.video_rtp_lost),
+        video_nack_requested: now
+            .video_nack_requested
+            .saturating_sub(then.video_nack_requested),
+        video_retransmitted: now
+            .video_retransmitted
+            .saturating_sub(then.video_retransmitted),
+        video_access_units_completed: now
+            .video_access_units_completed
+            .saturating_sub(then.video_access_units_completed),
+        video_access_units_without_marker: now
+            .video_access_units_without_marker
+            .saturating_sub(then.video_access_units_without_marker),
+        video_access_units_empty: now
+            .video_access_units_empty
+            .saturating_sub(then.video_access_units_empty),
+        video_access_units_evicted: now
+            .video_access_units_evicted
+            .saturating_sub(then.video_access_units_evicted),
+        video_rtp_stale_timestamp: now
+            .video_rtp_stale_timestamp
+            .saturating_sub(then.video_rtp_stale_timestamp),
+        video_rtp_completed_timestamp: now
+            .video_rtp_completed_timestamp
+            .saturating_sub(then.video_rtp_completed_timestamp),
+        video_fu_dropped_sequence_gap: now
+            .video_fu_dropped_sequence_gap
+            .saturating_sub(then.video_fu_dropped_sequence_gap),
+        video_fu_dropped_timestamp_boundary: now
+            .video_fu_dropped_timestamp_boundary
+            .saturating_sub(then.video_fu_dropped_timestamp_boundary),
+        video_fu_dropped_unterminated: now
+            .video_fu_dropped_unterminated
+            .saturating_sub(then.video_fu_dropped_unterminated),
+        video_fu_orphan_fragments: now
+            .video_fu_orphan_fragments
+            .saturating_sub(then.video_fu_orphan_fragments),
+        video_nal_oversize_dropped: now
+            .video_nal_oversize_dropped
+            .saturating_sub(then.video_nal_oversize_dropped),
+        video_payload_unusable: now
+            .video_payload_unusable
+            .saturating_sub(then.video_payload_unusable),
+        video_ssrc_switches: now
+            .video_ssrc_switches
+            .saturating_sub(then.video_ssrc_switches),
+        video_ssrc_switch_partial_dropped: now
+            .video_ssrc_switch_partial_dropped
+            .saturating_sub(then.video_ssrc_switch_partial_dropped),
+        video_retired_ssrc_ignored: now
+            .video_retired_ssrc_ignored
+            .saturating_sub(then.video_retired_ssrc_ignored),
     }
 }
 

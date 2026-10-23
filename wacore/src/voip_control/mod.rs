@@ -499,6 +499,7 @@ pub struct MediaStats {
     pub rtp_received: u32,
     #[builder(default)]
     pub rtp_payload_type_unexpected: u32,
+    /// Audio SRTP failures, including video carriers that advertise piggybacked audio.
     #[builder(default)]
     pub srtp_unprotect_failed: u32,
     #[builder(default)]
@@ -535,6 +536,101 @@ pub struct MediaStats {
     pub forwarding_envelope_rejected: u32,
     #[builder(default)]
     pub codec_switches: u16,
+    /// Video RTP packets on the direct path whose tag authenticated, whether or not a video plane
+    /// was active to show them.
+    ///
+    /// The video half of `rtp_received`. Without it a call showing no picture cannot say whether
+    /// the peer's video never arrived or arrived and was not usable.
+    #[builder(default)]
+    pub video_rtp_received: u32,
+    /// Video RTP packets on the direct path whose tag did not authenticate, with or without an
+    /// active video plane: wrong recv keys, or keys for a device other than the one sending.
+    #[builder(default)]
+    pub video_srtp_unprotect_failed: u32,
+    /// Audio RTP packets recovered from inside another packet the peer sent: its video and video
+    /// FEC packets carry its audio piggybacked in a video call.
+    #[builder(default)]
+    pub piggybacked_audio_received: u32,
+    /// Packets on a payload type outside the audio profile that nevertheless authenticated under the
+    /// peer's keys: its FEC, retransmission or app-data streams rather than noise or a stale key.
+    #[builder(default)]
+    pub auxiliary_rtp_authenticated: u32,
+    /// The payload type of the most recent packet counted in `rtp_payload_type_unexpected`, so a
+    /// report can name the type instead of only counting it. Zero until one arrives.
+    #[builder(default)]
+    pub last_unexpected_payload_type: u8,
+    /// Forward sequence gaps observed on the peer video stream being reassembled.
+    /// Late arrivals do not subtract from this counter. Gaps request a keyframe through
+    /// the coalesced recovery path.
+    #[builder(default)]
+    pub video_rtp_lost: u32,
+    /// Packets of our video the peer asked for again in generic NACKs, counted per packet named.
+    ///
+    /// Zero across a call that lost video means the peer recovers some other way (a keyframe
+    /// request, or waiting for the next keyframe), which is the question this answers.
+    #[builder(default)]
+    pub video_nack_requested: u32,
+    /// Protected video packets emitted for retransmission in answer to those NACKs.
+    /// Fewer than requested when history or retry limits reject a request. Driver backpressure
+    /// and transport failures can still prevent delivery.
+    #[builder(default)]
+    pub video_retransmitted: u32,
+    /// Access units the peer's video reassembled into and handed on, before the application's sink.
+    ///
+    /// The baseline every other reassembly counter below is read against: packets that arrived
+    /// whole can still fail to become a picture, and these say which way.
+    #[builder(default)]
+    pub video_access_units_completed: u32,
+    /// Of those, access units closed by the next RTP timestamp because their marker packet never
+    /// came. Handed on, but likely missing their tail.
+    #[builder(default)]
+    pub video_access_units_without_marker: u32,
+    /// RTP timestamps whose packets left no complete NAL when the next timestamp began: pictures
+    /// that produced nothing to hand on.
+    #[builder(default)]
+    pub video_access_units_empty: u32,
+    /// Completed access units dropped because the depacketizer's ready queue was full.
+    #[builder(default)]
+    pub video_access_units_evicted: u32,
+    /// Authenticated video packets discarded for a timestamp older than the access unit being
+    /// assembled, or than the one last completed. Arrived, but too late to join their picture.
+    #[builder(default)]
+    pub video_rtp_stale_timestamp: u32,
+    /// Authenticated video packets discarded because they carry the timestamp of the access unit
+    /// whose marker already completed it.
+    #[builder(default)]
+    pub video_rtp_completed_timestamp: u32,
+    /// Partially reassembled FU-A NALs dropped because a fragment's sequence number skipped.
+    #[builder(default)]
+    pub video_fu_dropped_sequence_gap: u32,
+    /// Partially reassembled FU-A NALs dropped because the next RTP timestamp began before their
+    /// end fragment arrived.
+    #[builder(default)]
+    pub video_fu_dropped_timestamp_boundary: u32,
+    /// Partially reassembled FU-A NALs dropped because another NAL, or their access unit's marker,
+    /// arrived before their end fragment.
+    #[builder(default)]
+    pub video_fu_dropped_unterminated: u32,
+    /// FU-A middle or end fragments ignored because no start fragment was on record.
+    #[builder(default)]
+    pub video_fu_orphan_fragments: u32,
+    /// NALs refused because they would grow a NAL or an access unit past the reassembly limit.
+    #[builder(default)]
+    pub video_nal_oversize_dropped: u32,
+    /// Video payloads with no usable NAL: empty, NAL type 0, a packetization mode the depacketizer
+    /// does not support, or a truncated FU-A or STAP-A.
+    #[builder(default)]
+    pub video_payload_unusable: u32,
+    /// Times reassembly moved from one peer video SSRC to another. The first stream is not one.
+    #[builder(default)]
+    pub video_ssrc_switches: u32,
+    /// Those switches that discarded a partial access unit the previous stream left behind.
+    #[builder(default)]
+    pub video_ssrc_switch_partial_dropped: u32,
+    /// Video packets from an SSRC the peer had switched away from, ignored for their picture
+    /// while the switch settles. Their piggybacked audio is still played.
+    #[builder(default)]
+    pub video_retired_ssrc_ignored: u32,
 }
 
 impl MediaStats {
